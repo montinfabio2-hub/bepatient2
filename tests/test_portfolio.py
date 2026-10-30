@@ -390,5 +390,126 @@ class TestWorkflowSimulation(unittest.TestCase):
             self.assertFalse(os.path.exists(marker))
 
 
+class TestMissingPrices(unittest.TestCase):
+    """Fase B: prezzo mancante -> ultimo prezzo noto, segnalazione; senza ultimo prezzo -> errore."""
+
+    LAST = {'UST': {'close': 125.0, 'date': '2026-10-20'}, 'EUNL': {'close': 45.0, 'date': '2026-10-20'}}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = os.path.join(self.tmp.name, 'data.json')
+        self.gh_out = os.path.join(self.tmp.name, 'github-output')
+
+    def write_data(self, last_prices):
+        portfolio = {'last_update': '2026-01-01'}
+        if last_prices is not None:
+            portfolio['last_prices'] = last_prices
+        with open(self.path, 'w') as f:
+            json.dump({'km_base': 1.0, 'portfolio': portfolio}, f)
+
+    def run_main(self, live):
+        out, err = io.StringIO(), io.StringIO()
+        env = {pu.LEDGER_ENV: ledger_text(*base_rows()), 'GITHUB_OUTPUT': self.gh_out}
+        with mock.patch.dict(os.environ, env, clear=False), \
+                mock.patch.object(pu, 'fetch_prices', return_value=live), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = pu.main(self.path)
+        return rc, out.getvalue(), err.getvalue()
+
+    def flagged(self):
+        return os.path.exists(self.gh_out) and 'stale=1' in read_text(self.gh_out)
+
+    def test_all_prices_available_no_warning_and_last_prices_saved(self):
+        self.write_data(None)
+        rc, out, err = self.run_main({'UST': 130.0, 'EUNL': 40.0})
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn('ATTENZIONE', out)
+        self.assertFalse(self.flagged())
+        lp = load_json(self.path)['portfolio']['last_prices']
+        self.assertEqual(lp['UST'], {'close': 130.0, 'date': str(date.today())})
+
+    def test_missing_price_uses_last_known_and_is_reported(self):
+        self.write_data(self.LAST)
+        rc, out, err = self.run_main({'EUNL': 40.0})           # UST non disponibile
+        self.assertEqual(rc, 0, err)
+        pub = load_json(self.path)['portfolio']
+        # UST: costo medio 110, ultimo prezzo noto 125 (non il costo medio, che darebbe 0%)
+        self.assertEqual(pub['personal']['holdings']['UST']['perf_pct'], 13.64)
+        self.assertEqual(pub['personal']['holdings']['EUNL']['perf_pct'], -20.0)   # prezzo di oggi
+        self.assertIn('ATTENZIONE', out)
+        self.assertIn('UST', out)
+        self.assertIn('2026-10-20', out)
+        self.assertTrue(self.flagged())
+        # l'ultimo prezzo di UST resta quello vecchio (con la sua data); EUNL si aggiorna
+        self.assertEqual(pub['last_prices']['UST'], {'close': 125.0, 'date': '2026-10-20'})
+        self.assertEqual(pub['last_prices']['EUNL'], {'close': 40.0, 'date': str(date.today())})
+        pu.validate_public_portfolio(pub)
+
+    def test_zero_or_invalid_live_price_counts_as_missing(self):
+        self.write_data(self.LAST)
+        rc, out, err = self.run_main({'UST': 0, 'EUNL': float('nan')})
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(self.flagged())
+        self.assertEqual(load_json(self.path)['portfolio']['last_prices']['UST']['close'], 125.0)
+
+    def test_missing_price_without_last_known_fails_and_keeps_file(self):
+        self.write_data(None)
+        before = sha(self.path)
+        rc, out, err = self.run_main({'EUNL': 40.0})           # UST mancante, nessun ultimo prezzo
+        self.assertEqual(rc, 1)
+        self.assertIn('UST', err)
+        self.assertEqual(sha(self.path), before)
+        self.assertFalse(self.flagged())
+
+    def test_corrupt_last_prices_are_ignored_not_trusted(self):
+        self.write_data({'UST': {'close': -5, 'date': '2026-10-20'}, 'XXXX': {'close': 1, 'date': '2026-10-20'},
+                         'EUNL': {'close': 'x', 'date': '2026-10-20'}})
+        before = sha(self.path)
+        rc, out, err = self.run_main({'EUNL': 40.0})
+        self.assertEqual(rc, 1)                                 # UST: ultimo prezzo non valido -> errore
+        self.assertEqual(sha(self.path), before)
+
+    def test_ticker_not_in_ledger_does_not_need_a_price(self):
+        self.write_data(None)
+        rc, out, err = self.run_main({'UST': 130.0, 'EUNL': 40.0})   # VWCE/IS3R non nel registro
+        self.assertEqual(rc, 0, err)
+        self.assertFalse(self.flagged())
+
+    def test_last_prices_schema(self):
+        led = pu.parse_ledger(ledger_text(*base_rows()), TODAY)
+        good = pu.build_public_portfolio(led, BASE_PRICES, TODAY)
+        good['last_prices'] = {'UST': {'close': 130.0, 'date': '2026-10-17'}}
+        pu.validate_public_portfolio(good)
+        bad_cases = {
+            'prezzo negativo': {'UST': {'close': -1, 'date': '2026-10-17'}},
+            'campo extra': {'UST': {'close': 1.0, 'date': '2026-10-17', 'qty': 3}},
+            'ticker sconosciuto': {'XXXX': {'close': 1.0, 'date': '2026-10-17'}},
+            'data non valida': {'UST': {'close': 1.0, 'date': 'ieri'}},
+            'non e un dizionario': [],
+        }
+        for name, lp in bad_cases.items():
+            with self.subTest(caso=name):
+                data = pu.build_public_portfolio(led, BASE_PRICES, TODAY)
+                data['last_prices'] = lp
+                with self.assertRaises(pu.SchemaError):
+                    pu.validate_public_portfolio(data)
+
+    def test_no_ledger_values_in_output_when_price_missing(self):
+        self.write_data(self.LAST)
+        out, err = io.StringIO(), io.StringIO()
+        canary = ledger_text(row('personal', '2026-01-05', 'UST', CANARY_QTY, CANARY_PRICE),
+                             row('personal', '2026-02-05', 'EUNL', '5', '100.00'),
+                             row('family', '2026-04-01', 'EUNL', '20', '100.00'))
+        env = {pu.LEDGER_ENV: canary, 'GITHUB_OUTPUT': self.gh_out}
+        with mock.patch.dict(os.environ, env, clear=False), \
+                mock.patch.object(pu, 'fetch_prices', return_value={'EUNL': 40.0}), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(pu.main(self.path), 0)
+        for text in (out.getvalue(), err.getvalue(), read_text(self.path), read_text(self.gh_out)):
+            self.assertNotIn(CANARY_QTY, text)
+            self.assertNotIn(CANARY_PRICE, text)
+
+
 if __name__ == '__main__':
     unittest.main()

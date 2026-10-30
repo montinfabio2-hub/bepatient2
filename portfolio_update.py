@@ -34,6 +34,10 @@ class LedgerError(Exception):
     """Registro acquisti mancante o non valido. Il messaggio non contiene mai dati del registro."""
 
 
+class PriceError(Exception):
+    """Prezzo di mercato non disponibile e nessun ultimo prezzo noto. Il messaggio non contiene dati del registro."""
+
+
 class SchemaError(Exception):
     """Il JSON pubblico non rispetta lo schema consentito. Il messaggio non contiene valori."""
 
@@ -122,6 +126,60 @@ def fetch_prices():
             prices[ticker] = p
             print(f"  {ticker}: {p}")
     return prices
+
+
+# ── PREZZI MANCANTI: si usa l'ultimo prezzo noto e si segnala ────────────────
+# Gli ultimi prezzi di mercato (pubblici, non fanno parte del registro) stanno in
+# data.json > portfolio > last_prices come {"TICKER": {"close": 123.45, "date": "AAAA-MM-GG"}}.
+
+def load_last_prices(path):
+    """Ultimi prezzi noti da data.json; voci non valide o file assente/illeggibile: ignorati."""
+    try:
+        with open(path, 'r') as f:
+            raw = json.load(f).get('portfolio', {}).get('last_prices', {})
+    except (OSError, ValueError, AttributeError):
+        return {}
+    valid = {}
+    if isinstance(raw, dict):
+        for t, v in raw.items():
+            if t in ETFS and _valid_last_price(v):
+                valid[t] = {'close': v['close'], 'date': v['date']}
+    return valid
+
+
+def resolve_prices(live, last, needed, today):
+    """Prezzi da usare nei calcoli.
+
+    Ritorna (prezzi, ultimi_prezzi_da_salvare, ticker_non_aggiornati).
+    Se manca il prezzo di un ETF presente nel registro si usa l'ultimo noto; se non
+    esiste nemmeno quello si solleva PriceError (nessun file viene modificato).
+    """
+    saved = {t: dict(v) for t, v in last.items()}
+    prices, stale, missing = {}, [], []
+    for t, p in live.items():
+        if _is_num(p) and p > 0:
+            saved[t] = {'close': p, 'date': str(today)}
+    for t in sorted(needed):
+        p = live.get(t)
+        if _is_num(p) and p > 0:
+            prices[t] = p
+        elif t in last:
+            prices[t] = last[t]['close']
+            stale.append(t)
+        else:
+            missing.append(t)
+    if missing:
+        raise PriceError('prezzo non disponibile e nessun ultimo prezzo salvato per: ' + ', '.join(missing))
+    return prices, saved, stale
+
+
+def _signal_stale(tickers):
+    """Fa risultare 'fallito' il workflow (ultimo passaggio) cosi' GitHub invia l'avviso."""
+    path = os.environ.get('GITHUB_OUTPUT')
+    if path:
+        with open(path, 'a') as f:
+            f.write('stale=1\n')
+    print('::warning::Prezzo non disponibile per ' + ', '.join(tickers) + ': usato l\'ultimo prezzo noto')
 
 
 # ── CALCOLI (logica invariata; i dati riservati restano interni) ─────────────
@@ -239,10 +297,21 @@ def _is_num(x):
     return isinstance(x, (int, float)) and not isinstance(x, bool) and x == x and abs(x) != float('inf')
 
 
+def _valid_last_price(v):
+    return (isinstance(v, dict) and set(v) == {'close', 'date'}
+            and _is_num(v['close']) and 0 < v['close'] < 1_000_000
+            and isinstance(v['date'], str) and bool(_RE_DATE.fullmatch(v['date'])))
+
+
 def validate_public_portfolio(p):
     """Verifica che 'portfolio' contenga solo i campi pubblici consentiti."""
-    if not isinstance(p, dict) or set(p) != {*PORTFOLIOS, 'last_update'}:
+    base = {*PORTFOLIOS, 'last_update'}
+    if not isinstance(p, dict) or set(p) not in (base, base | {'last_prices'}):
         raise SchemaError('portfolio: chiavi non ammesse o mancanti')
+    if 'last_prices' in p:
+        lp = p['last_prices']
+        if not isinstance(lp, dict) or not all(t in ETFS and _valid_last_price(v) for t, v in lp.items()):
+            raise SchemaError('portfolio.last_prices non valido')
     if not isinstance(p['last_update'], str) or not _RE_DATE.fullmatch(p['last_update']):
         raise SchemaError('portfolio.last_update non valido')
     for name in PORTFOLIOS:
@@ -269,7 +338,7 @@ def validate_public_portfolio(p):
 
 # ── SCRITTURA ────────────────────────────────────────────────────────────────
 
-def update_data_file(path, ledger, prices, today):
+def update_data_file(path, ledger, prices, today, last_prices=None):
     """Calcola e scrive data.json solo se tutto e' valido (scrittura atomica).
 
     Gli altri campi del file (km, ecc.) restano invariati; il blocco 'portfolio'
@@ -283,6 +352,8 @@ def update_data_file(path, ledger, prices, today):
         site_data = {}
 
     portfolio = build_public_portfolio(ledger, prices, today)
+    if last_prices is not None:
+        portfolio['last_prices'] = last_prices
     validate_public_portfolio(portfolio)
     site_data['portfolio'] = portfolio
 
@@ -307,10 +378,13 @@ def main(data_path='data.json'):
         today = date.today()
         ledger = parse_ledger(os.environ.get(LEDGER_ENV), today)
         step = 'recupero dei prezzi'
-        prices = fetch_prices()
+        live = fetch_prices()
+        last = load_last_prices(data_path)
+        needed = {t for rows in ledger.values() for _, t, _, _ in rows}
+        prices, saved, stale = resolve_prices(live, last, needed, today)
         step = 'calcolo e scrittura di data.json'
-        pub = update_data_file(data_path, ledger, prices, today)
-    except (LedgerError, SchemaError) as e:
+        pub = update_data_file(data_path, ledger, prices, today, last_prices=saved)
+    except (LedgerError, SchemaError, PriceError) as e:
         print(f'ERRORE ({step}): {e}', file=sys.stderr)
         return 1
     except Exception as e:  # nessun traceback: potrebbe riportare dati del registro
@@ -319,6 +393,10 @@ def main(data_path='data.json'):
         return 1
     print(f"Personal: {pub['personal']['performance_pct']}%  Family: {pub['family']['performance_pct']}%")
     print("data.json updated")
+    if stale:
+        for t in stale:
+            print(f"ATTENZIONE: prezzo di {t} non disponibile, usato l'ultimo noto del {last[t]['date']}")
+        _signal_stale(stale)
     return 0
 
 

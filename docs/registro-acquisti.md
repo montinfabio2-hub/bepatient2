@@ -49,3 +49,11 @@ Se il Secret manca, e' vuoto o contiene righe non valide, il workflow **fallisce
 modificare `data.json`**. Il messaggio indica numero di riga e campo (ad esempio
 `riga 12: prezzo non valido`), mai il contenuto. Se il workflow non usa il Secret
 corretto, `data.json` resta com'e'.
+
+## Prezzi di mercato mancanti
+
+Se una notte non si riesce a leggere il prezzo di un ETF, lo script usa l'**ultimo prezzo noto**
+(salvato in `data.json` con la sua data) e il workflow risulta **fallito** nell'ultimo passaggio
+("Avviso prezzi mancanti"): i dati sono comunque pubblicati e GitHub ti segnala l'errore.
+Il giorno dopo lo script riprova da solo. Se non esiste ancora nessun ultimo prezzo, il workflow
+fallisce senza modificare `data.json`.

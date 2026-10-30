@@ -19,6 +19,7 @@ jobs:
         run: python3 -m unittest discover -s tests
 
       - name: Update Portfolio prices
+        id: update
         # Il registro acquisti arriva dal Secret e non viene mai scritto nei file ne' nei log.
         env:
           PORTFOLIO_LEDGER: ${{ secrets.PORTFOLIO_LEDGER }}
@@ -39,3 +40,11 @@ jobs:
           # Se il push non riesce (es. main modificato nel frattempo) il workflow FALLISCE e te ne accorgi.
           git pull --rebase origin main
           git push
+
+      - name: Avviso prezzi mancanti
+        # I dati sono gia' stati pubblicati con l'ultimo prezzo noto; il workflow risulta
+        # "fallito" apposta, cosi' GitHub ti segnala che un prezzo non e' stato aggiornato.
+        if: steps.update.outputs.stale == '1'
+        run: |
+          echo "::error::Uno o piu' prezzi non erano disponibili: usato l'ultimo prezzo noto (vedi il passaggio Update Portfolio prices)"
+          exit 1
