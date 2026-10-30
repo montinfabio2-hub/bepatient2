@@ -36,8 +36,6 @@ jobs:
           git add data.json
           git diff --staged --quiet && exit 0
           git commit -m "Auto-update portfolio $(date +'%d/%m/%Y')"
-          for i in 1 2 3 4 5; do
-            git pull --rebase -X ours origin main && git push && break
-            echo "Retry $i..."
-            sleep 5
-          done
+          # Se il push non riesce (es. main modificato nel frattempo) il workflow FALLISCE e te ne accorgi.
+          git pull --rebase origin main
+          git push
